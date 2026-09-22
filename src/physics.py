@@ -75,8 +75,12 @@ def _isotropic_inertia() -> np.ndarray:
 
 LINK_INERTIA = _isotropic_inertia()  # shape (6, 3, 3)
 
-C_VISCOUS = np.full(N_JOINTS, 1.0)
-C_COULOMB = np.full(N_JOINTS, 0.4)
+# 手首リンク(4-6)は腕リンク(1-3)より慣性が1-2桁小さいため、全関節共通の
+# 摩擦係数だと手首がクーロン摩擦に支配され、わずかな制御トルクでは静止摩擦を
+# 超えられず目標に到達できなくなることをPTP制御の検証で確認した。関節ごとの
+# 慣性スケールに応じて摩擦係数も小さくする(coulomb/viscous比0.4は共通)。
+C_VISCOUS = np.array([1.0, 1.0, 1.0, 0.05, 0.05, 0.01])
+C_COULOMB = np.array([0.4, 0.4, 0.4, 0.02, 0.02, 0.004])
 V_STRIBECK = 0.03
 
 
@@ -212,15 +216,22 @@ def rnea(q: np.ndarray, q_dot: np.ndarray, q_ddot: np.ndarray, gravity: float = 
 
 def mass_matrix(q: np.ndarray) -> np.ndarray:
     """質量行列M(q)。RNEAをq_ddot=単位ベクトル・q_dot=0・重力なしでN_JOINTS回
-    呼び出し、各列を求める(合成剛体法)。shape (...,6) -> shape (...,6,6)"""
+    呼び出し、各列を求める(合成剛体法)。shape (...,6) -> shape (...,6,6)
+
+    N_JOINTS回をPythonループで直列に呼ぶと(制御ループなど1状態あたり何度も
+    呼ばれる場面で)オーバーヘッドが大きいため、6本の単位ベクトルをすべて
+    1つのバッチ次元に詰め込み、rneaを1回だけ呼ぶ(rneaは"..."で任意のバッチ
+    次元に対応しているため、そのまま利用できる。src.model.mass_matrix_torch
+    のtorch版と同じ最適化)。
+    """
     batch_shape = q.shape[:-1]
-    zero = np.zeros(batch_shape + (N_JOINTS,))
-    M = np.zeros(batch_shape + (N_JOINTS, N_JOINTS))
-    for j in range(N_JOINTS):
-        qdd = np.zeros(batch_shape + (N_JOINTS,))
-        qdd[..., j] = 1.0
-        M[..., :, j] = rnea(q, zero, qdd, gravity=0.0)
-    return M
+    eye = np.eye(N_JOINTS)
+    extra_dims = (1,) * len(batch_shape)
+    q_rep = np.broadcast_to(q, (N_JOINTS,) + batch_shape + (N_JOINTS,))
+    zero_rep = np.zeros_like(q_rep)
+    qdd_rep = np.broadcast_to(eye.reshape((N_JOINTS,) + extra_dims + (N_JOINTS,)), q_rep.shape)
+    tau_rep = rnea(q_rep, zero_rep, qdd_rep, gravity=0.0)  # (6, *batch_shape, 6)
+    return np.moveaxis(tau_rep, 0, -1)  # M[..., i, j] = tau_rep[j, ..., i]
 
 
 def bias_forces(q: np.ndarray, q_dot: np.ndarray, g: float = GRAVITY) -> np.ndarray:
@@ -295,6 +306,33 @@ def simulate(
         state = rk4_step(state, dt, tau_seq[t], c_viscous, c_coulomb, g)
         traj.append(state)
     return np.stack(traj, axis=0)
+
+
+def simulate_batch(
+    initial_states: np.ndarray,
+    dt: float,
+    n_steps: int,
+    tau_seqs: np.ndarray,
+    c_viscous: np.ndarray = C_VISCOUS,
+    c_coulomb: np.ndarray = C_COULOMB,
+    g: float = GRAVITY,
+) -> np.ndarray:
+    """複数軌道を同時にシミュレートする(データセット生成の高速化用)。
+
+    mass_matrix/rneaはバッチ次元(...)に対応しているため、軌道数分をまとめて
+    1回のPythonループ(時間ステップのみ)で処理でき、軌道ごとに逐次
+    `simulate`を呼ぶより大幅に高速(1軌道あたりのPythonループオーバーヘッドが
+    軌道数で償却される)。
+
+    initial_states: shape (batch, 12), tau_seqs: shape (batch, n_steps, 6)
+    Returns: shape (batch, n_steps + 1, 12)
+    """
+    traj = [initial_states]
+    state = initial_states
+    for t in range(n_steps):
+        state = rk4_step(state, dt, tau_seqs[:, t], c_viscous, c_coulomb, g)
+        traj.append(state)
+    return np.stack(traj, axis=1)
 
 
 def forward_kinematics(q: np.ndarray) -> np.ndarray:
