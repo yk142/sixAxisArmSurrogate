@@ -320,3 +320,71 @@ class StructuredFrictionGrayBoxModel(AutoregressiveModel):
         k3 = self.dynamics(state + 0.5 * dt * k2, u)
         k4 = self.dynamics(state + dt * k3, u)
         return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+_N_TRIL = N_JOINTS * (N_JOINTS + 1) // 2  # 21
+
+
+class LightweightGrayBoxModel(AutoregressiveModel):
+    """軽量グレーボックス版(#19): RNEAの反復計算を排除し、質量行列M(q)・
+    バイアス力bias(q,q_dot)をそれぞれ小さなMLPで直接近似する。摩擦の構造化
+    (粘性+クーロン、係数のみ学習)は`StructuredFrictionGrayBoxModel`と同じ。
+
+    M(q)はコレスキー分解L(q)を出力するMLPで構成し(対角はsoftplusで正、
+    非対角は自由)、M=L L^Tとすることで対称正定値性を保証する。
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        n_hidden_layers: int = 2,
+        dt: float = DT,
+        v_stribeck: float = V_STRIBECK,
+    ):
+        super().__init__()
+        self.mass_net = _make_mlp(2 * N_JOINTS, _N_TRIL, hidden_dim, n_hidden_layers)
+        self.bias_net = _make_mlp(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
+        self.log_c_viscous = nn.Parameter(torch.zeros(N_JOINTS))
+        self.log_c_coulomb = nn.Parameter(torch.zeros(N_JOINTS))
+        self.dt = dt
+        self.v_stribeck = v_stribeck
+        tril_idx = torch.tril_indices(N_JOINTS, N_JOINTS)
+        self.register_buffer("_tril_row", tril_idx[0])
+        self.register_buffer("_tril_col", tril_idx[1])
+
+    def mass_matrix(self, q: torch.Tensor) -> torch.Tensor:
+        enc_q = torch.cat([torch.sin(q), torch.cos(q)], dim=-1)
+        raw = self.mass_net(enc_q)  # (..., 21)
+        batch_shape = q.shape[:-1]
+        L = torch.zeros(*batch_shape, N_JOINTS, N_JOINTS, dtype=q.dtype, device=q.device)
+        L[..., self._tril_row, self._tril_col] = raw
+        diag = torch.diagonal(L, dim1=-2, dim2=-1)
+        diag_pos = nn.functional.softplus(diag) + 1e-3
+        L = L - torch.diag_embed(diag) + torch.diag_embed(diag_pos)
+        return L @ L.transpose(-1, -2)
+
+    def residual_torque(self, state: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        q_dot = state[..., N_JOINTS:]
+        c_viscous = torch.exp(self.log_c_viscous)
+        c_coulomb = torch.exp(self.log_c_coulomb)
+        return c_viscous * q_dot + c_coulomb * torch.tanh(q_dot / self.v_stribeck)
+
+    def dynamics(self, state: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        q, q_dot = state[..., :N_JOINTS], state[..., N_JOINTS:]
+
+        M = self.mass_matrix(q)
+        bias = self.bias_net(encode_state(state))
+        friction = self.residual_torque(state, u)
+
+        rhs = (u - bias - friction).unsqueeze(-1)
+        q_ddot = torch.linalg.solve(M, rhs).squeeze(-1)
+        return torch.cat([q_dot, q_ddot], dim=-1)
+
+    def step(self, state: torch.Tensor, u: torch.Tensor | None = None) -> torch.Tensor:
+        u = self._default_u(state, u)
+        dt = self.dt
+        k1 = self.dynamics(state, u)
+        k2 = self.dynamics(state + 0.5 * dt * k1, u)
+        k3 = self.dynamics(state + 0.5 * dt * k2, u)
+        k4 = self.dynamics(state + dt * k3, u)
+        return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
