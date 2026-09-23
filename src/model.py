@@ -13,6 +13,8 @@ numpy実装と全く同じ式・同じ変数名で書いており、DHパラメ�
 渡す(ブラックボックス版でのみ使用。グレーボックス版は物理量をそのまま使う)。
 入力は6次元 u=[tau1,...,tau6]。
 """
+import math
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -66,7 +68,11 @@ def _dh_transform_torch(a: float, alpha: float, d: float, theta: torch.Tensor) -
     theta: shape (...,) -> R: shape (..., 3, 3), p: shape (..., 3)
     """
     ct, st = torch.cos(theta), torch.sin(theta)
-    ca, sa = np.cos(alpha), np.sin(alpha)
+    # np.cos/np.sinはnumpy float64スカラーを返し、float32テンソルと混ぜた際に
+    # torch.compileの型推論(fake tensor)がeagerと異なるdtype昇格をしてしまい
+    # コンパイル時エラーになることを確認した(#16)。math.cos/math.sinで
+    # 素のpython floatのまま保つことで回避する。
+    ca, sa = math.cos(alpha), math.sin(alpha)
     ones = torch.ones_like(ct)
     zeros = torch.zeros_like(ct)
     row0 = torch.stack([ct, -st, zeros], dim=-1)
@@ -218,16 +224,36 @@ class AutoregressiveModel(nn.Module):
             return u
         return torch.zeros(*state.shape[:-1], CONTROL_DIM, device=state.device)
 
+    def _get_step_fn(self, use_compile: bool):
+        """`use_compile=True`の場合、`self.step`のコンパイル版をキャッシュして
+        返す(#16: torch.compileでRNEAのPythonループのオーバーヘッドを削減し、
+        真値シミュレータと同等以上の速度を得る)。初回呼び出し(=形状ごとの
+        再コンパイル)はオーバーヘッドが大きい(数十秒)ため、同じ形状で多数回
+        呼び出す場合(長いロールアウト、多数のPTPエピソード等)にのみ有効。
+        """
+        if not use_compile:
+            return self.step
+        if not hasattr(self, "_compiled_step"):
+            self._compiled_step = torch.compile(self.step)
+        return self._compiled_step
+
     @torch.no_grad()
-    def rollout(self, initial_state: np.ndarray, n_steps: int, tau_seq: np.ndarray | None = None) -> np.ndarray:
+    def rollout(
+        self,
+        initial_state: np.ndarray,
+        n_steps: int,
+        tau_seq: np.ndarray | None = None,
+        use_compile: bool = False,
+    ) -> np.ndarray:
         device = next(self.parameters()).device
         state = torch.as_tensor(initial_state, dtype=torch.float32, device=device)
+        step_fn = self._get_step_fn(use_compile)
         traj = [state]
         for t in range(n_steps):
             u = None if tau_seq is None else torch.as_tensor(
                 tau_seq[t], dtype=torch.float32, device=device
             ).expand(*state.shape[:-1], CONTROL_DIM)
-            state = self.step(state, u)
+            state = step_fn(state, u)
             traj.append(state)
         return torch.stack(traj, dim=0).cpu().numpy()
 

@@ -65,3 +65,15 @@ def test_zero_residual_matches_known_physics_without_friction():
             predicted = model.step(state, u).numpy()
         expected = ph.rk4_step(state_np, dt, tau_np, c_viscous=zero_friction, c_coulomb=zero_friction)
         assert np.allclose(predicted, expected, atol=1e-4)
+
+
+def test_compiled_rollout_matches_uncompiled():
+    """#16: torch.compile版のrolloutが非コンパイル版と一致すること。"""
+    model = StructuredFrictionGrayBoxModel()
+    rng = np.random.default_rng(4)
+    ic = np.concatenate([rng.uniform(-1, 1, N_JOINTS), rng.uniform(-1, 1, N_JOINTS)])
+    tau = rng.uniform(-1, 1, size=(3, N_JOINTS))
+
+    plain = model.rollout(ic, 3, tau_seq=tau, use_compile=False)
+    compiled = model.rollout(ic, 3, tau_seq=tau, use_compile=True)
+    assert np.allclose(plain, compiled, atol=1e-4)
