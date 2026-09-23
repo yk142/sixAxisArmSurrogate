@@ -3,3 +3,4 @@ numpy>=2.5
 scipy>=1.18
 matplotlib>=3.11
 pytest>=9.1
+numba>=0.67
