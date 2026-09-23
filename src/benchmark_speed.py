@@ -17,8 +17,9 @@ import time
 import numpy as np
 import torch
 
+import src.physics_numba as physics_numba
 from src.model import NSSModel, StructuredFrictionGrayBoxModel
-from src.physics import N_JOINTS, simulate, simulate_batch
+from src.physics import C_COULOMB, C_VISCOUS, DH_A, DH_ALPHA, DH_D, GRAVITY, LINK_COM, LINK_INERTIA, LINK_MASS, N_JOINTS, V_STRIBECK, simulate, simulate_batch
 
 DT = 0.002
 SEED = 0
@@ -43,6 +44,26 @@ def benchmark_single_trajectory(n_steps: int = 500) -> None:
     print(f"[single trajectory, {n_steps} steps]")
     print(f"  true physics (numpy):     {t_true:.3f}s")
     print(f"  graybox surrogate(torch): {t_gray:.3f}s  (speedup {t_true / t_gray:.2f}x)")
+
+    # #26: 摩擦なしの参照物理(M(q)/bias(q,q_dot))は学習パラメータを持たない
+    # ため、推論時はPyTorch外でも計算できる。numbaでJITコンパイルした単一
+    # 状態向けRNEAで、単一軌道(バッチ化できない用途、例えばリアルタイム制御)
+    # の速度を比較する。
+    physics_numba.rollout_numba(
+        ic, DT, tau, DH_A, DH_ALPHA, DH_D, LINK_MASS, LINK_COM, LINK_INERTIA, GRAVITY, C_VISCOUS, C_COULOMB, V_STRIBECK
+    )  # warmup (JITコンパイル)
+    t0 = time.time()
+    physics_numba.rollout_numba(
+        ic, DT, tau, DH_A, DH_ALPHA, DH_D, LINK_MASS, LINK_COM, LINK_INERTIA, GRAVITY, C_VISCOUS, C_COULOMB, V_STRIBECK
+    )
+    t_numba = time.time() - t0
+    print(f"  numba (単一軌道向け):     {t_numba:.4f}s  (speedup {t_true / t_numba:.2f}x)")
+
+    sim_time = n_steps * DT
+    print(
+        f"  実時間比: torch.compile(単一軌道)は#22参照、numbaは"
+        f"{sim_time / t_numba:.2f}x(1.0より大きいほど実時間より速い)"
+    )
 
 
 def benchmark_batch(batch: int = 50, n_steps: int = 200) -> None:
