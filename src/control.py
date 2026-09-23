@@ -50,6 +50,27 @@ class PTPController:
         tau = M @ q_ddot_desired + bias
         return np.clip(tau, -self.tau_max, self.tau_max)
 
+    def reset_batch(self, batch_size: int) -> None:
+        self.integral = np.zeros((batch_size, N_JOINTS))
+
+    def compute_batch(self, state: np.ndarray, target: np.ndarray, dt: float) -> np.ndarray:
+        """`compute`のバッチ版。state: shape (batch,12), target: shape (batch,6) -> tau: shape (batch,6)
+
+        physics.mass_matrix/bias_forcesが元々バッチ次元(`...`)に対応している
+        ことを利用し、多数のシナリオを1回の呼び出しでまとめて計算する
+        (#12: 数十シナリオのPTP検証を高速化するため)。
+        """
+        q, q_dot = state[..., :N_JOINTS], state[..., N_JOINTS:]
+        e = angular_error(q, target)
+        self.integral = np.clip(self.integral + e * dt, -INTEGRAL_CLIP, INTEGRAL_CLIP)
+
+        q_ddot_desired = -self.kp * e - self.ki * self.integral - self.kd * q_dot
+
+        M = mass_matrix(q)
+        bias = bias_forces(q, q_dot)
+        tau = np.einsum("...ij,...j->...i", M, q_ddot_desired) + bias
+        return np.clip(tau, -self.tau_max, self.tau_max)
+
 
 def run_ptp_true(
     initial_state: np.ndarray, target: np.ndarray, n_steps: int, dt: float, controller: PTPController | None = None
@@ -64,6 +85,65 @@ def run_ptp_true(
         state = rk4_step(state, dt, tau)
         traj.append(state.copy())
     return np.stack(traj, axis=0)
+
+
+def run_ptp_true_batch(
+    initial_states: np.ndarray,
+    targets: np.ndarray,
+    n_steps: int,
+    dt: float,
+    controller: PTPController | None = None,
+) -> np.ndarray:
+    """真の物理モデルで多数のシナリオを同時に閉ループPTP制御する(#12)。
+
+    initial_states: shape (batch,12), targets: shape (batch,6)
+    Returns: traj shape (n_steps+1, batch, 12)
+    """
+    controller = controller or PTPController()
+    batch = initial_states.shape[0]
+    controller.reset_batch(batch)
+    state = initial_states.copy()
+    traj = [state.copy()]
+    for _ in range(n_steps):
+        tau = controller.compute_batch(state, targets, dt)
+        state = rk4_step(state, dt, tau)
+        traj.append(state.copy())
+    return np.stack(traj, axis=0)
+
+
+def run_ptp_surrogate_batch(
+    model,
+    initial_states: np.ndarray,
+    targets: np.ndarray,
+    n_steps: int,
+    dt: float,
+    controller: PTPController | None = None,
+) -> np.ndarray:
+    """NSSサロゲートモデルで多数のシナリオを同時に閉ループPTP制御する(#12)。
+
+    model.step(state, u)はtorch側で"..."バッチ次元に対応しているため、
+    そのまま複数シナリオをまとめて処理できる。
+
+    initial_states: shape (batch,12), targets: shape (batch,6)
+    Returns: traj shape (n_steps+1, batch, 12)
+    """
+    import torch
+
+    controller = controller or PTPController()
+    batch = initial_states.shape[0]
+    controller.reset_batch(batch)
+    device = next(model.parameters()).device
+    state_t = torch.as_tensor(initial_states, dtype=torch.float32, device=device)
+    state = initial_states.copy()
+    traj = [state_t]
+    for _ in range(n_steps):
+        tau = controller.compute_batch(state, targets, dt)
+        tau_t = torch.as_tensor(tau, dtype=torch.float32, device=device)
+        with torch.no_grad():
+            state_t = model.step(state_t, tau_t)
+        state = state_t.cpu().numpy()
+        traj.append(state_t)
+    return torch.stack(traj, dim=0).cpu().numpy()
 
 
 def run_ptp_surrogate(
