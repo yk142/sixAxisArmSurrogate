@@ -16,7 +16,14 @@ N_TRAIN_TRAJ = 150
 N_VAL_TRAJ = 30
 SEED = 0
 BATCH_SIZE = 256
-LR = 1e-3
+# #8: LR=1e-3固定だと105エポック学習しても摩擦係数(特に手首関節)が初期値
+# (全関節1.0)付近から動き切らず、真の係数(手動で設定すると学習損失が
+# ほぼ0になることを確認済み)に到達しなかった。LR=0.05固定に上げると序盤は
+# 急速に改善する(20エポックで損失が半分未満になる)ものの、最適点付近で
+# 減衰がないため発振・オーバーシュートしてしまう。コサイン減衰で高LRから
+# 徐々に下げることで、序盤の速い収束と終盤の安定した微調整を両立する。
+LR = 1e-2
+LR_MIN = 1e-4
 GRAD_CLIP_NORM = 1.0
 
 # torch版RNEAはmass_matrix 1回でも内部で6リンク分のPythonループを2周する
@@ -61,6 +68,8 @@ def train(
 
     model = model_cls().to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    total_epochs = sum(n_epochs for _, n_epochs in curriculum)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=LR_MIN)
 
     n_samples = x0_train_t.shape[0]
     global_epoch = 0
@@ -81,6 +90,7 @@ def train(
                 optimizer.step()
                 epoch_loss += loss.item() * idx.shape[0]
 
+            scheduler.step()
             global_epoch += 1
             if local_epoch % 10 == 0 or local_epoch == n_epochs - 1:
                 with torch.no_grad():
