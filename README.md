@@ -111,7 +111,10 @@ M(q) q̈ = tau - bias(q,q̇) - friction(q̇)
   約3.2倍(プラント単体)・約1.8倍(コントローラ込みの閉ループ全体、真値
   モデルと数値誤差の範囲で一致)。単一軌道のリアルタイム制御という、
   torch.compileでは実時間に届かなかった用途(#22)を解決した。ただしバッチ
-  処理には効果がない(各軌道が独立にJIT実行されるため)。
+  処理には効果がない(各軌道が独立にJIT実行されるため)。#12と同じ50
+  ランダムシナリオ検証をnumba版(Pythonループで逐次実行)でも行い、真値
+  46/50・グレーボックス41/50・平均誤差もtorch版とほぼ完全に一致すること
+  (数値的な等価性)を確認した。
 
 ## 教訓
 
@@ -279,6 +282,7 @@ python -m src.train                 # M2: グレーボックスサロゲート�
 python -m src.evaluate_graybox      # M2: 開ループロールアウト誤差・摩擦係数の検証
 python -m src.evaluate_ptp          # M2: 計算トルク法PTP制御(真値/サロゲート比較)
 python -m src.evaluate_ptp_scenarios  # M2: 多数のランダムシナリオでのPTP制御検証
+python -m src.evaluate_ptp_scenarios_numba  # 同上をnumba版(単一軌道向け)で検証
 python -m src.benchmark_speed       # 真値シミュレータ/サロゲートの計算速度比較
 ```
 
