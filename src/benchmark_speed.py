@@ -17,8 +17,9 @@ import time
 import numpy as np
 import torch
 
+import src.model_numba as model_numba
 import src.physics_numba as physics_numba
-from src.model import NSSModel, StructuredFrictionGrayBoxModel
+from src.model import LightweightGrayBoxModel, NSSModel, StructuredFrictionGrayBoxModel
 from src.physics import C_COULOMB, C_VISCOUS, DH_A, DH_ALPHA, DH_D, GRAVITY, LINK_COM, LINK_INERTIA, LINK_MASS, N_JOINTS, V_STRIBECK, simulate, simulate_batch
 
 DT = 0.002
@@ -63,6 +64,25 @@ def benchmark_single_trajectory(n_steps: int = 500) -> None:
     print(
         f"  実時間比: torch.compile(単一軌道)は#22参照、numbaは"
         f"{sim_time / t_numba:.2f}x(1.0より大きいほど実時間より速い)"
+    )
+
+    # #28: 軽量NN(#19、本物のMLP)のforward passもRNEAより単純なため、
+    # numbaでのJITコンパイルがさらに効きやすい。
+    lightweight = LightweightGrayBoxModel()
+    lightweight.eval()
+
+    t0 = time.time()
+    lightweight.rollout(ic, n_steps, tau_seq=tau)
+    t_light_torch = time.time() - t0
+    print(f"  軽量NN(torch, uncompiled): {t_light_torch:.4f}s")
+
+    model_numba.rollout_from_lightweight_model(lightweight, ic, DT, tau)  # warmup
+    t0 = time.time()
+    model_numba.rollout_from_lightweight_model(lightweight, ic, DT, tau)
+    t_light_numba = time.time() - t0
+    print(
+        f"  軽量NN(numba):             {t_light_numba:.4f}s  "
+        f"(vs真値 speedup {t_true / t_light_numba:.1f}x, 実時間比 {sim_time / t_light_numba:.1f}x)"
     )
 
 
