@@ -49,6 +49,39 @@ def final_errors(traj: np.ndarray, targets: np.ndarray) -> np.ndarray:
     return err.mean(axis=0)
 
 
+def plot_transient_examples(
+    true_traj: np.ndarray, gray_traj: np.ndarray, targets: np.ndarray, true_err: np.ndarray
+) -> None:
+    """代表的な数シナリオの過渡応答(関節角度の時系列)を真値/サロゲートで比較する。
+
+    true_errが中央値に近いシナリオ(典型例)と最大のシナリオ(最も収束が遅い例)
+    の2本を選ぶ。
+    """
+    order = np.argsort(true_err)
+    typical_idx = order[len(order) // 2]
+    worst_idx = order[-1]
+    t = np.arange(true_traj.shape[0]) * DT
+
+    fig, axes = plt.subplots(2, N_JOINTS, figsize=(3 * N_JOINTS, 6), sharex=True)
+    for row, (idx, label) in enumerate([(typical_idx, "typical"), (worst_idx, "worst")]):
+        for j in range(N_JOINTS):
+            ax = axes[row, j]
+            ax.plot(t, true_traj[:, idx, j], label="true", linewidth=1.3)
+            ax.plot(t, gray_traj[:, idx, j], "--", label="graybox", linewidth=1.1)
+            ax.axhline(targets[idx, j], color="gray", linestyle=":", linewidth=1)
+            if row == 0:
+                ax.set_title(f"q{j+1}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(f"{label}\n(err={true_err[idx]:.3f})", fontsize=8)
+            if row == 1:
+                ax.set_xlabel("time [s]")
+    axes[0, 0].legend(fontsize=7, loc="upper right")
+    fig.suptitle("PTP transient response: true (solid) vs graybox (dashed)")
+    fig.tight_layout()
+    fig.savefig(f"{OUT_DIR}/m2_ptp_scenarios_transient.png", dpi=120)
+    print(f"saved {OUT_DIR}/m2_ptp_scenarios_transient.png")
+
+
 def main() -> None:
     rng = np.random.default_rng(SEED)
     initial_states, targets = sample_scenarios(N_SCENARIOS, rng)
@@ -90,6 +123,8 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(f"{OUT_DIR}/m2_ptp_scenarios.png", dpi=120)
     print(f"saved {OUT_DIR}/m2_ptp_scenarios.png")
+
+    plot_transient_examples(true_traj, gray_traj, targets, true_err)
 
 
 if __name__ == "__main__":
