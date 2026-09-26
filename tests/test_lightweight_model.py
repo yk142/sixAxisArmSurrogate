@@ -24,4 +24,5 @@ def test_step_shape_and_gradient_flow():
     loss = out.pow(2).sum()
     loss.backward()
     assert model.mass_net[0].weight.grad is not None
-    assert model.bias_net[0].weight.grad is not None
+    assert model.bias_net.trunk[0].weight.grad is not None
+    assert model.bias_net.heads[0][0].weight.grad is not None

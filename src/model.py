@@ -61,6 +61,26 @@ def _make_mlp(in_dim: int, out_dim: int, hidden_dim: int, n_hidden_layers: int) 
     return nn.Sequential(*layers)
 
 
+class PerJointBiasNet(nn.Module):
+    """共有トランクで状態特徴を作り、関節ごとの独立headでbiasを出力する。"""
+
+    def __init__(self, in_dim: int, n_joints: int, hidden_dim: int, n_hidden_layers: int):
+        super().__init__()
+        trunk_layers: list[nn.Module] = [nn.Linear(in_dim, hidden_dim), nn.Tanh()]
+        for _ in range(n_hidden_layers - 1):
+            trunk_layers += [nn.Linear(hidden_dim, hidden_dim), nn.Tanh()]
+        self.trunk = nn.Sequential(*trunk_layers)
+
+        head_hidden_dim = max(1, hidden_dim // 2)
+        self.heads = nn.ModuleList(
+            _make_mlp(hidden_dim, 1, head_hidden_dim, 1) for _ in range(n_joints)
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        features = self.trunk(x)
+        return torch.cat([head(features) for head in self.heads], dim=-1)
+
+
 def _dh_transform_torch(a: float, alpha: float, d: float, theta: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """修正DH変換(physics.dh_transformのtorch版)。回転行列Rと並進pのみ返す
     (RNEAでは4x4同次変換ではなくR,pの組で十分なため)。
@@ -343,7 +363,7 @@ class LightweightGrayBoxModel(AutoregressiveModel):
     ):
         super().__init__()
         self.mass_net = _make_mlp(2 * N_JOINTS, _N_TRIL, hidden_dim, n_hidden_layers)
-        self.bias_net = _make_mlp(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
+        self.bias_net = PerJointBiasNet(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
         self.log_c_viscous = nn.Parameter(torch.zeros(N_JOINTS))
         self.log_c_coulomb = nn.Parameter(torch.zeros(N_JOINTS))
         self.dt = dt

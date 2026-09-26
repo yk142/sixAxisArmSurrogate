@@ -132,7 +132,12 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
     with torch.no_grad():
         val_pred = model.bias_net(encode_state(state_val))
         rel_err = (val_pred - bias_val_t).norm() / bias_val_t.norm()
+        joint_rel_err = (val_pred - bias_val_t).norm(dim=0) / bias_val_t.norm(dim=0)
     print(f"[bias_net] final val relative error = {rel_err.item():.4f}")
+    joint_summary = " ".join(
+        f"q{i + 1}={joint_rel_err[i].item():.4f}" for i in range(N_JOINTS)
+    )
+    print(f"[bias_net] final val relative error by joint: {joint_summary}")
     return epoch_loss, val_loss
 
 
