@@ -41,7 +41,13 @@ def train(
     device: str = "cpu",
     curriculum: list[tuple[int, int]] | None = None,
     model_cls: type[AutoregressiveModel] = StructuredFrictionGrayBoxModel,
+    model: AutoregressiveModel | None = None,
 ) -> AutoregressiveModel:
+    """model_cls: 新規モデルを構築する場合のクラス(既定)。model: 既に構築済みの
+    モデル(#32のように事前学習済み重みの一部を凍結して続きを学習する場合)を
+    渡すとmodel_clsは無視される。いずれの場合もoptimizerはrequires_grad=Trueの
+    パラメータのみを更新する。
+    """
     curriculum = curriculum if curriculum is not None else CURRICULUM
     k_max = max(k for k, _ in curriculum)
 
@@ -66,8 +72,9 @@ def train(
     def loss_fn(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         return (((pred - target) / channel_std) ** 2).mean()
 
-    model = model_cls().to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR)
+    model = (model if model is not None else model_cls()).to(device)
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.Adam(trainable_params, lr=LR)
     total_epochs = sum(n_epochs for _, n_epochs in curriculum)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs, eta_min=LR_MIN)
 
