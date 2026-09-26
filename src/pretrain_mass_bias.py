@@ -51,6 +51,12 @@ def train_mass_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
     q_val_t = torch.as_tensor(q_val)
     m_val_t = torch.as_tensor(m_val)
 
+    # #32での検証: bias(q,q̇)と違いM(q)の成分間スケール差は1.6-26%相対誤差
+    # 程度と軽微(手首関節でもM(q)の絶対値自体は非ゼロで無視できるほど小さく
+    # ない)。むしろ一部の成分(例: M11)は分散が非常に小さい(ほぼ定数)ため、
+    # 標準偏差で正規化すると些細な絶対誤差が正規化後に爆発し、他の成分の
+    # 学習を阻害する数値不安定を招くことを確認した。そのためM(q)は正規化なし
+    # の生MSEのまま学習する(bias_netとは対照的、下記参照)。
     optimizer = torch.optim.Adam(model.mass_net.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=LR * 0.01)
     n = q_train_t.shape[0]
@@ -94,6 +100,11 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
 
     from src.model import encode_state
 
+    # bias(q,q̇)は腕関節(q1-3)と手首関節(q4-6)で振幅が1-600倍異なる
+    # (コリオリ項が腕側の大きな慣性・角速度で支配的になるため)。mass_netと
+    # 同じ理由で成分ごとの標準偏差正規化が必須。
+    channel_std = bias_train_t.std(dim=0, keepdim=True).clamp_min(1e-4)
+
     optimizer = torch.optim.Adam(model.bias_net.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=LR * 0.01)
     n = state_train.shape[0]
@@ -104,7 +115,7 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
         for start in range(0, n, BATCH_SIZE):
             idx = perm[start : start + BATCH_SIZE]
             pred = model.bias_net(encode_state(state_train[idx]))
-            loss = ((pred - bias_train_t[idx]) ** 2).mean()
+            loss = (((pred - bias_train_t[idx]) / channel_std) ** 2).mean()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -114,7 +125,7 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
 
         with torch.no_grad():
             val_pred = model.bias_net(encode_state(state_val))
-            val_loss = ((val_pred - bias_val_t) ** 2).mean().item()
+            val_loss = (((val_pred - bias_val_t) / channel_std) ** 2).mean().item()
         if epoch % 5 == 0 or epoch == N_EPOCHS - 1:
             print(f"[bias_net] epoch {epoch+1:3d} train_mse={epoch_loss:.6f} val_mse={val_loss:.6f}")
 
