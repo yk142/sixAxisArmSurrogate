@@ -93,17 +93,28 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
     q_train, qd_train, bias_train = sample_bias_data(N_TRAIN, rng)
     q_val, qd_val, bias_val = sample_bias_data(N_VAL, rng)
 
+    g_train = bias_forces(q_train, np.zeros_like(qd_train)).astype(np.float32)
+    c_train = (bias_train - g_train).astype(np.float32)
+    g_val = bias_forces(q_val, np.zeros_like(qd_val)).astype(np.float32)
+    c_val = (bias_val - g_val).astype(np.float32)
+
     state_train = torch.as_tensor(np.concatenate([q_train, qd_train], axis=-1))
-    bias_train_t = torch.as_tensor(bias_train)
+    g_train_t = torch.as_tensor(g_train)
+    c_train_t = torch.as_tensor(c_train)
+    bias_train_t = g_train_t + c_train_t
     state_val = torch.as_tensor(np.concatenate([q_val, qd_val], axis=-1))
-    bias_val_t = torch.as_tensor(bias_val)
+    g_val_t = torch.as_tensor(g_val)
+    c_val_t = torch.as_tensor(c_val)
+    bias_val_t = g_val_t + c_val_t
 
     from src.model import encode_state
 
-    # bias(q,q̇)は腕関節(q1-3)と手首関節(q4-6)で振幅が1-600倍異なる
-    # (コリオリ項が腕側の大きな慣性・角速度で支配的になるため)。mass_netと
-    # 同じ理由で成分ごとの標準偏差正規化が必須。
-    channel_std = bias_train_t.std(dim=0, keepdim=True).clamp_min(1e-4)
+    # bias(q,q̇)は腕関節(q1-3)と手首関節(q4-6)で振幅が1-600倍異なる。
+    # 分解後も各物理項の成分ごとの標準偏差で正規化し、振幅差による学習
+    # トレードオフを避ける。
+    g_channel_std = g_train_t.std(dim=0, keepdim=True).clamp_min(1e-4)
+    c_channel_std = c_train_t.std(dim=0, keepdim=True).clamp_min(1e-4)
+    bias_channel_std = bias_train_t.std(dim=0, keepdim=True).clamp_min(1e-4)
 
     optimizer = torch.optim.Adam(model.bias_net.parameters(), lr=LR)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=N_EPOCHS, eta_min=LR * 0.01)
@@ -114,8 +125,12 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
         epoch_loss = 0.0
         for start in range(0, n, BATCH_SIZE):
             idx = perm[start : start + BATCH_SIZE]
-            pred = model.bias_net(encode_state(state_train[idx]))
-            loss = (((pred - bias_train_t[idx]) / channel_std) ** 2).mean()
+            enc = encode_state(state_train[idx])
+            g_pred = model.bias_net.gravity(enc)
+            c_pred = model.bias_net.coriolis(enc)
+            g_loss = (((g_pred - g_train_t[idx]) / g_channel_std) ** 2).mean()
+            c_loss = (((c_pred - c_train_t[idx]) / c_channel_std) ** 2).mean()
+            loss = g_loss + c_loss
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -124,15 +139,38 @@ def train_bias_net(model: LightweightGrayBoxModel) -> tuple[float, float]:
         scheduler.step()
 
         with torch.no_grad():
-            val_pred = model.bias_net(encode_state(state_val))
-            val_loss = (((val_pred - bias_val_t) / channel_std) ** 2).mean().item()
+            enc_val = encode_state(state_val)
+            g_val_pred = model.bias_net.gravity(enc_val)
+            c_val_pred = model.bias_net.coriolis(enc_val)
+            val_g_loss = (((g_val_pred - g_val_t) / g_channel_std) ** 2).mean()
+            val_c_loss = (((c_val_pred - c_val_t) / c_channel_std) ** 2).mean()
+            val_loss = (val_g_loss + val_c_loss).item()
+            val_pred = g_val_pred + c_val_pred
+            val_bias_loss = (((val_pred - bias_val_t) / bias_channel_std) ** 2).mean().item()
         if epoch % 5 == 0 or epoch == N_EPOCHS - 1:
-            print(f"[bias_net] epoch {epoch+1:3d} train_mse={epoch_loss:.6f} val_mse={val_loss:.6f}")
+            print(
+                f"[bias_net] epoch {epoch+1:3d} train_mse={epoch_loss:.6f} "
+                f"val_mse={val_loss:.6f} val_g={val_g_loss.item():.6f} "
+                f"val_c={val_c_loss.item():.6f} val_bias={val_bias_loss:.6f}"
+            )
 
     with torch.no_grad():
-        val_pred = model.bias_net(encode_state(state_val))
+        enc_val = encode_state(state_val)
+        g_val_pred = model.bias_net.gravity(enc_val)
+        c_val_pred = model.bias_net.coriolis(enc_val)
+        val_pred = g_val_pred + c_val_pred
         rel_err = (val_pred - bias_val_t).norm() / bias_val_t.norm()
+        g_rel_joint = (g_val_pred - g_val_t).norm(dim=0) / g_val_t.norm(dim=0).clamp_min(1e-8)
+        c_rel_joint = (c_val_pred - c_val_t).norm(dim=0) / c_val_t.norm(dim=0).clamp_min(1e-8)
     print(f"[bias_net] final val relative error = {rel_err.item():.4f}")
+    print(
+        "[bias_net] gravity relative error by joint = "
+        + ", ".join(f"q{i+1}={100.0 * e.item():.2f}%" for i, e in enumerate(g_rel_joint))
+    )
+    print(
+        "[bias_net] coriolis relative error by joint = "
+        + ", ".join(f"q{i+1}={100.0 * e.item():.2f}%" for i, e in enumerate(c_rel_joint))
+    )
     return epoch_loss, val_loss
 
 

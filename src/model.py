@@ -325,6 +325,31 @@ class StructuredFrictionGrayBoxModel(AutoregressiveModel):
 _N_TRIL = N_JOINTS * (N_JOINTS + 1) // 2  # 21
 
 
+class DecomposedBiasNet(nn.Module):
+    """bias(q,q_dot) = gravity(q) + coriolis(q,q_dot) の軽量近似。
+
+    `forward`は従来のbias_netと同じくencode_state(state)を受け取り、(..., 6)
+    を返す。coriolis側はMLP出力をq_dotで関節ごとにゲートすることで、
+    q_dot=0のとき構造的に厳密なゼロを返す。
+    """
+
+    def __init__(self, hidden_dim: int, n_hidden_layers: int):
+        super().__init__()
+        self.gravity_net = _make_mlp(2 * N_JOINTS, N_JOINTS, hidden_dim, n_hidden_layers)
+        self.coriolis_net = _make_mlp(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
+
+    def gravity(self, encoded_state: torch.Tensor) -> torch.Tensor:
+        enc_q = encoded_state[..., : 2 * N_JOINTS]
+        return self.gravity_net(enc_q)
+
+    def coriolis(self, encoded_state: torch.Tensor) -> torch.Tensor:
+        q_dot = encoded_state[..., 2 * N_JOINTS :]
+        return self.coriolis_net(encoded_state) * q_dot
+
+    def forward(self, encoded_state: torch.Tensor) -> torch.Tensor:
+        return self.gravity(encoded_state) + self.coriolis(encoded_state)
+
+
 class LightweightGrayBoxModel(AutoregressiveModel):
     """軽量グレーボックス版(#19): RNEAの反復計算を排除し、質量行列M(q)・
     バイアス力bias(q,q_dot)をそれぞれ小さなMLPで直接近似する。摩擦の構造化
@@ -343,7 +368,7 @@ class LightweightGrayBoxModel(AutoregressiveModel):
     ):
         super().__init__()
         self.mass_net = _make_mlp(2 * N_JOINTS, _N_TRIL, hidden_dim, n_hidden_layers)
-        self.bias_net = _make_mlp(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
+        self.bias_net = DecomposedBiasNet(hidden_dim, n_hidden_layers)
         self.log_c_viscous = nn.Parameter(torch.zeros(N_JOINTS))
         self.log_c_coulomb = nn.Parameter(torch.zeros(N_JOINTS))
         self.dt = dt
