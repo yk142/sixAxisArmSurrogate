@@ -19,6 +19,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from src.base_physics import bias_forces_base, mass_matrix_base
 from src.physics import (
     DH_A,
     DH_ALPHA,
@@ -325,6 +326,13 @@ class StructuredFrictionGrayBoxModel(AutoregressiveModel):
 _N_TRIL = N_JOINTS * (N_JOINTS + 1) // 2  # 21
 
 
+def _init_last_linear_small(module: nn.Sequential, std: float = 1e-4) -> None:
+    last = module[-1]
+    if isinstance(last, nn.Linear):
+        nn.init.normal_(last.weight, mean=0.0, std=std)
+        nn.init.zeros_(last.bias)
+
+
 class LightweightGrayBoxModel(AutoregressiveModel):
     """軽量グレーボックス版(#19): RNEAの反復計算を排除し、質量行列M(q)・
     バイアス力bias(q,q_dot)をそれぞれ小さなMLPで直接近似する。摩擦の構造化
@@ -374,6 +382,91 @@ class LightweightGrayBoxModel(AutoregressiveModel):
 
         M = self.mass_matrix(q)
         bias = self.bias_net(encode_state(state))
+        friction = self.residual_torque(state, u)
+
+        rhs = (u - bias - friction).unsqueeze(-1)
+        q_ddot = torch.linalg.solve(M, rhs).squeeze(-1)
+        return torch.cat([q_dot, q_ddot], dim=-1)
+
+    def step(self, state: torch.Tensor, u: torch.Tensor | None = None) -> torch.Tensor:
+        u = self._default_u(state, u)
+        dt = self.dt
+        k1 = self.dynamics(state, u)
+        k2 = self.dynamics(state + 0.5 * dt * k1, u)
+        k3 = self.dynamics(state + 0.5 * dt * k2, u)
+        k4 = self.dynamics(state + dt * k3, u)
+        return state + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+
+
+class ResidualGrayBoxModel(AutoregressiveModel):
+    """Issue #38: 閉形式ベース物理 + 小さなMLP残差のグレーボックスモデル。
+
+    M(q)はベース質量行列のCholesky因子に下三角残差を足し、M=L L^T+eps I
+    とすることで対称正定値性を保つ。biasはベースbiasにMLP残差を加える。
+    摩擦はLightweightGrayBoxModelと同じ構造化摩擦。
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int = 64,
+        n_hidden_layers: int = 2,
+        dt: float = DT,
+        g: float = GRAVITY,
+        v_stribeck: float = V_STRIBECK,
+        mass_residual_scale: float = 0.05,
+    ):
+        super().__init__()
+        self.mass_net = _make_mlp(2 * N_JOINTS, _N_TRIL, hidden_dim, n_hidden_layers)
+        self.bias_net = _make_mlp(STATE_ENC_DIM, N_JOINTS, hidden_dim, n_hidden_layers)
+        _init_last_linear_small(self.mass_net)
+        _init_last_linear_small(self.bias_net)
+
+        self.log_c_viscous = nn.Parameter(torch.zeros(N_JOINTS))
+        self.log_c_coulomb = nn.Parameter(torch.zeros(N_JOINTS))
+        self.dt = dt
+        self.g = g
+        self.v_stribeck = v_stribeck
+        self.mass_residual_scale = mass_residual_scale
+        tril_idx = torch.tril_indices(N_JOINTS, N_JOINTS)
+        self.register_buffer("_tril_row", tril_idx[0])
+        self.register_buffer("_tril_col", tril_idx[1])
+        self.register_buffer("_eye", torch.eye(N_JOINTS))
+
+    def base_mass_matrix(self, q: torch.Tensor) -> torch.Tensor:
+        return mass_matrix_base(q)
+
+    def base_bias(self, q: torch.Tensor, q_dot: torch.Tensor) -> torch.Tensor:
+        return bias_forces_base(q, q_dot, self.g)
+
+    def mass_matrix(self, q: torch.Tensor) -> torch.Tensor:
+        enc_q = torch.cat([torch.sin(q), torch.cos(q)], dim=-1)
+        raw = self.mass_net(enc_q) * self.mass_residual_scale
+        batch_shape = q.shape[:-1]
+
+        delta_l = torch.zeros(*batch_shape, N_JOINTS, N_JOINTS, dtype=q.dtype, device=q.device)
+        delta_l[..., self._tril_row, self._tril_col] = raw
+
+        base_m = self.base_mass_matrix(q)
+        jitter = 1e-5 * self._eye.to(device=q.device, dtype=q.dtype)
+        base_l = torch.linalg.cholesky(base_m + jitter)
+        l = base_l + delta_l
+        return l @ l.transpose(-1, -2) + jitter
+
+    def bias(self, state: torch.Tensor) -> torch.Tensor:
+        q, q_dot = state[..., :N_JOINTS], state[..., N_JOINTS:]
+        return self.base_bias(q, q_dot) + self.bias_net(encode_state(state))
+
+    def residual_torque(self, state: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        q_dot = state[..., N_JOINTS:]
+        c_viscous = torch.exp(self.log_c_viscous)
+        c_coulomb = torch.exp(self.log_c_coulomb)
+        return c_viscous * q_dot + c_coulomb * torch.tanh(q_dot / self.v_stribeck)
+
+    def dynamics(self, state: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        q, q_dot = state[..., :N_JOINTS], state[..., N_JOINTS:]
+
+        M = self.mass_matrix(q)
+        bias = self.bias(state)
         friction = self.residual_torque(state, u)
 
         rhs = (u - bias - friction).unsqueeze(-1)
